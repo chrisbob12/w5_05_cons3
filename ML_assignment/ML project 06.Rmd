@@ -1,0 +1,351 @@
+---
+title: "Human Activity Recognition Exercise"
+author: "chrisbob12"
+date: "Tuesday, August 11, 2015"
+output: html_document
+---
+###Introduction
+This report is prepared as a submission for the Coursera course, *Practical Machine Learning*. The R markdown file, from which this is compiled is available from the same Github repository.
+The data for this analysis was made available by Groupware@LES under Creative Commons license. It was collected for a study in human activity recognition. The study and data set is described here:
+http://groupware.les.inf.puc-rio.br/har
+
+###The given data sets
+The data provided in two parts; identified as training and test sets. The test set is provided as a final prediction set.
+An initial look at the data reveals that there are 159 variables in addition to the previously identified outcome 'classe'.
+
+```{r, echo=FALSE, message=FALSE}
+library(caret)
+training <- read.csv(".\\ML_project\\pml-training.csv",stringsAsFactors = FALSE,
+                     strip.white = TRUE, na.strings = c("NA",""))
+testing <- read.csv(".\\ML_project\\pml-testing.csv",stringsAsFactors=FALSE,
+                    strip.white = TRUE, na.strings = c("NA",""))
+```
+What is the size of the given training and test sets?
+
+```{r,echo=FALSE}
+size <- matrix(c(nrow(training),ncol(training),nrow(testing),ncol(testing)),ncol=2)
+colnames(size) <- c("training","testing")
+rownames(size) <- c("rows","columns")
+size.table <- as.table(size)
+size.table
+```
+The given testing set is very small in comparison to the given training set. For this report the given training set will be split into a smaller training and testing set and the given testing set will be held back for the final predictions.
+
+###Initial exploration, cleaning and data compression
+We can Use the str() function to summarise the structure of the data sets, but will not execute the code in this report because the there is insufficient space to display the output from this function.
+
+```{r,eval=FALSE}
+str(training)
+str(testing)
+```
+Visual inspection of the str() output reveals a significant number of columns with either no data or a significant number of NAs, and occurrences of "#DIV/0", which suggests some further tests:
+
+```{r}
+sum(complete.cases(training))
+```
+So only about 2% of rows are complete. We can calculate the proportion of NAs in individual columns with the following code.
+
+```{r,eval=FALSE}
+colMeans(is.na(training))
+```
+Inspection of the output of this code, shows a significant number of columns with an average level of 0.9793089 NAs. Clearly, no meaningful model can be constructed with such sparse data, so we can eliminate these columns. The proportion calculated is used to identify these, and we can deal with blank entries and the "#DIV/0" entries.
+
+```{r}
+## Replace #DIV/0! and blank fields with NA
+training[training=="#DIV/0!"] <- NA
+testing[testing=="#DIV/0!"] <- NA
+## identify columns which are all or nearly all NA
+trainNA <- which(colMeans(is.na(training))>.97)
+testNA <- which(colMeans(is.na(training))>.97)
+```
+A check that we are looking at the same columns from test and training data reveals no discrepancies:
+
+```{r}
+## compare NA columns between training and testing
+checkNA <- trainNA != testNA
+sum(checkNA)
+```
+So it is safe to remove the (nearly) empty columns and tidy away the original training and testing sets, to free up memory.
+
+```{r}
+## remove NA columns
+training2 <- training[,-trainNA]
+testing2 <- testing[,-testNA]
+## make space
+saveRDS(training,"training.RDS")
+saveRDS(testing,"testing.RDS")
+rm(training)
+rm(testing)
+```
+By comparing the documentation provided by Groupware@LES with the data set, it appears that the set is made up of sequential samples of instantaneous sensor readings taken over the duration of each dumbbell biceps curl action made by each participant. The individual movements being tracked throughout a 'window' of time as a series of samples of sensor output.
+It seems likely that the empty columns were intended for post-processing calculations on the raw sensor data, and when we look at the complete cases, we can see that these calculations have been only been made in rows with a new_window flag.
+Example calculations include minimum, maximum and mean of the output of a particular sensor axis within a single time window, and it seems likely that these summary calculations were intended for classifiying a model of the whole action of a dumbbell biceps curl.
+It is clear from the given test set that we do not have data summaries of the whole action on which to make classifications, and we can only classify against instantaneous sensor data, since that is what is given: one sensor sample per prediction. This is the confirming reason for eliminating the nearly empty columns from the given testing and training sets.
+It is also clear that the variables for timestamp and window can be discarded, since the timestamps in the given testing set are at arbitrary points in the dumbbell biceps curl action. While we're at it, the spurious row number column may be discarded.
+
+```{r}
+##eliminate row numbers, user, timestamp, window information
+losecols <- c("X","user","timestamp","window")
+repdata <- grepl(paste(losecols,collapse="|"), colnames(training2))
+repdata <- which(repdata==FALSE)
+training2 <- training2[,repdata]
+testing2 <- testing2[,repdata]
+```
+The data sets have now been reduced to about 1/3 their original size.
+
+```{r,echo=FALSE}
+size2 <- matrix(c(nrow(training2),ncol(training2),nrow(testing2),ncol(testing2)),ncol=2)
+colnames(size2) <- c("training2","testing2")
+rownames(size2) <- c("rows","columns")
+size.table <- as.table(size2)
+size.table
+```
+The outcomes, 'classe' are factor variables, and there is a risk that the machine learning algorithms will mistake the factor levels as continuous variables, so these are converted to characters.
+
+```{r, echo=FALSE}
+training2$classe <- as.character(training2$classe)
+```
+
+###Identifying factors
+We have already made some progress in identifying relevant factors in the process of cleaning up the data sets, but we should also consider any correlations within the remaining data.
+####Correlated factors
+Caret's inbuilt findCorrelation function is used to identify columns with high internal correlation and retain those with lowest mean correlation. For the sake of argument, factors with correlations greater than 0.95 are candidates for elimination.
+
+```{r}
+corMat <- cor(training2[,-53])
+hiCor <- findCorrelation(corMat,0.95)
+```
+The columns to eliminate are:
+
+```{r}
+colnames(training2[,hiCor])
+```
+```{r,echo=FALSE}
+testing2 <- testing2[,-hiCor]
+training2 <- training2[,-hiCor]
+```
+From a separate analysis, it appears that the cross-correlated factors are different streams from one sensor; this makes sense if one considers that the axes of sensors are unlikely to be aligned with the axes of the users.
+
+####Zero and near-zero variance factors
+We also check for variables which have values which are all the same or nearly so. The nearZeroVar function showed that there are no columns with zero or near-zero variance.
+
+###Cross-validation strategy
+Having reduced the factors in the data set, we need to consider which algorithm to build our model with. This can be done by comparing the out of sample (OOS) accuracy of candidate algorithms on the dataset. Because the outcome measures are unscaled factors, accuracy is the only meaningful measure of model performance. Out of sample accuracy is measured by training a model on a selection of the data available and using the resulting model to make predictions on data which was not used for training, but has outcomes which can be compared with the predictions.
+
+Since this is a large dataset, it will take a long time to train the candidate algorithms, especially on an older or lower-specified computers, so the training is performed on a  small, but representative proportion.
+The outcomes in the data set are distributed fairly evenly. From trial and error, we can train acceptably rapidly on about 500 data points, but is this useful for drawing general conclusions about different models?
+
+```{r,echo=FALSE}
+table(training2$classe)
+```
+The above table shows the distribution of each outcome in the original training data. If we have five hundred data points, this is about 2.5% of the data set, and since the createDataPartition function attempts to maintain a proportional distribution, we are likely to have 80-100 examples of each outcome in 'classe'. Since we will be testing on the remaining 97.5% we can be confident that the models have low bias at the cost of potential high variability.
+
+We will also use the same level of test:train ratio for selecting covariates, and for the final model, will use the more common split of 60% training to 40% testing, in the expectation of achieving higher accuracy, although with a potential trade-off on overfitting.
+
+###Comparing algorithms
+We train four prototype models:
+
+* random forest
+* boosting model
+* linear discriminant analysis
+* Recursive Partitioning and Regression Trees (rpart)
+
+A general linear model would be possible, but only if the factor outcomes were broken up into dummy variables: for the sake of simplicity, this was not done.
+
+```{r,echo=FALSE,message=FALSE}
+##at this stage, it would be useful to compare training techniques. Due to
+##limited computer resources this will be done with small training sets.
+seedval <- 1234
+set.seed(seedval)
+##inTrain <- createDataPartition(y=training2$classe,p=0.01,list=FALSE)
+inTrain1 <- createDataPartition(y=training2$classe,p=0.025,times=1,list=FALSE)
+train1 <- training2[inTrain1,]
+test1 <- training2[-inTrain1,]
+
+## Random Forest model
+if(file.exists("modelFitrf25.RDS")==TRUE){
+  modelFit1 <- readRDS(".\\modelFitrf25.RDS")
+}else{
+  modelFit1 <- train(as.factor(classe) ~.,data=train1,method="rf")
+  saveRDS(modelFit1,paste("modelFitrf25.RDS"))
+}
+
+## Boosting model
+if(file.exists("modelFitgbm25.RDS")==TRUE){
+  modelFit2 <- readRDS(".\\modelFitgbm25.RDS")
+}else{
+  modelFit2 <- train(as.factor(classe) ~.,data=train1,method="gbm")
+  saveRDS(modelFit2,"modelFitgbm25.RDS")
+}
+
+## Linear discriminant analysis model
+if(file.exists("modelFitlda25.RDS")==TRUE){
+  modelFit3 <- readRDS(".\\modelFitlda25.RDS")
+}else{
+  modelFit3 <- train(as.factor(classe) ~.,data=train1,method="lda")
+  saveRDS(modelFit3,"modelFitlda25.RDS")
+}
+
+## Recursive Partitioning and Regression Trees model
+if(file.exists("modelFitrpart25.RDS")==TRUE){
+  modelFit4 <- readRDS(".\\modelFitrpart25.RDS")
+}else{
+  modelFit4 <- train(as.factor(classe) ~.,data=train1,method="rpart")
+  saveRDS(modelFit4,"modelFitrpart25.RDS")
+}
+
+rfpreds <- predict(modelFit1,newdata=test1)
+gbmpreds <- predict(modelFit2,newdata=test1)
+ldapreds <- predict(modelFit3,newdata=test1)
+rpartpreds <- predict(modelFit4,newdata=test1)
+
+rfresult <- confusionMatrix(rfpreds,test1$classe)
+gbmresult <- confusionMatrix(gbmpreds,test1$classe)
+ldaresult <- confusionMatrix(ldapreds,test1$classe)
+rpartresult <- confusionMatrix(rpartpreds,test1$classe)
+
+results <- matrix(c(rfresult$overall[1:2],gbmresult$overall[1:2],
+              ldaresult$overall[1:2],rpartresult$overall[1:2]),ncol=2)
+colnames(results) <- names(rfresult$overall[1:2])
+rownames(results) <- c("random forest","boosting","linear discriminant analysis","rpart")
+results.table <- as.table(results)
+```
+
+```{r,echo=FALSE}
+results.table
+
+```
+The above table shows the OOS accuracy and kappa statistics for each of the trained models. From this we can see that the accuracy levels appear to be sufficient for a plausible model and each method has roughly equivalent accuracy. There is a clear spread of kappa values, which relate the observed accuracy with the expected accuracy, and allow like for like comparison of classifier performances. The random forest model clearly has the best kappa value, and is thus the algorithm of choice for further development.
+
+###Refining the Covariate selection
+The strategy for further development of the model is to reduce the covariates to those which predict the outcomes and eliminate those which make no contribution to the predictions. Apart from making the model more intelligible, this also reduces variability arising from modelling the noise due to non-predictive covariates.
+
+```{r,echo=FALSE}
+## random forest model with PCA
+set.seed(seedval)
+preProc <- preProcess(train1[,-49],method="pca",thresh=.95)
+preObj <- predict(preProc,train1[,-49])
+pretest <- predict(preProc,test1[,-49])
+
+if(file.exists("modelFitpca25.RDS")==TRUE){
+  modelFitpca <- readRDS(".\\modelFitpca25.RDS")
+}else{
+  modelFitpca <- train(as.factor(train1$classe)~.,method="rf",data=preObj)
+  saveRDS(modelFitpca,"modelFitpca25.RDS")
+}
+
+prepredict <- predict(modelFitpca,newdata=pretest)
+pcaResult <- confusionMatrix(prepredict,test1$classe)
+
+results2 <- matrix(c(rfresult$overall[1:2],
+                     pcaResult$overall[1:2]),ncol=2,byrow=TRUE)
+colnames(results2) <- names(rfresult$overall[1:2])
+rownames(results2) <- c("random forest","random forest with PCA")
+results2.table <- as.table(results2)
+
+```
+####Principal Components Analysis (PCA)
+This was done with caret's pre-processing with a threshold set at 0.95 on a random forest model - this should reduce the number of factors to those which explain 95% of the outcomes. The results are compared with those for the random forest trained earlier:
+
+```{r,echo=FALSE}
+results2.table
+
+```
+As can be seen, the PCA version is less accurate than the non-PCA version and has a significantly lower kappa statistic.
+
+####Variable Importance (varImp)
+An alternative approach is to calculate the importance of variables with caret's varImp method. The varImp function ranks the importance of the variables' contribution to predicting the outcomes. In the first instance, we select an arbitrary number (twenty) of variables with which to make a test model, and the top twenty are used in a new random forest model to compare with the random forest model we have just trained. The same train:test ratio of 2.5% is used for each.
+
+```{r,echo=FALSE}
+## Variable Importance
+newvars <- as.data.frame(varImp(modelFit1)[1])
+newvarnames <- rownames(newvars)[order(newvars$Overall, decreasing=TRUE)]
+
+newvarnames <- newvarnames[1:20]
+vndata <- grepl(paste(newvarnames,collapse="|"), colnames(train1))
+vndata <- which(vndata==TRUE)
+train3 <- train1[,c(vndata,49)]
+test3 <- test1[,c(vndata,49)]
+if(file.exists("modelFitpca25.RDS")==TRUE){
+  modelFitvarimp <- readRDS(".\\modelFitvarimp25.RDS")
+}else{
+  modelFitvarimp <- train(as.factor(classe) ~.,data=train3,method="rf")
+  saveRDS(modelFitvarimp,"modelFitvarimp25.RDS")  
+}
+
+##varimppreds <- as.factor(predict(modelFitvarimp,newdata=test3y))
+varimppreds <- predict(modelFitvarimp,newdata=test3[,-21])
+##varimpresult <- confusionMatrix(varimppreds,test3x)
+varimpresult <- confusionMatrix(varimppreds,test3[,21])
+results3 <- matrix(c(rfresult$overall[1:2],
+                     varimpresult$overall[1:2]),ncol=2,byrow=TRUE)
+colnames(results3) <- names(rfresult$overall[1:2])
+rownames(results3) <- c("random forest","top 20 variables")
+results3.table <- as.table(results3)
+
+results3.table
+
+```
+The above table compares the OOS accuracy and kappa statistics of initial random forest model with 48 covariates and a random forest trained on the top 20 covariates. It can be seen that trimming down to the top 20 variables improves both the accuracy and kappa statistic. At 86% OOS accuracy on a mere 2.5% of the data, we are also inclined to take our chances with this model. So we shall use this approach to covariate selection for the final model.
+
+###Final Model
+The final model is trained with only 20 of the variables present from the original 160, and the given training set is split into 60% for training and 40% on which the trained model will be tested. The model will be applied to the given test set, to form predictions, although it is not possible to validate the predictions except in the context of submitting them as part of the course.
+
+```{r,echo=FALSE}
+##*****FINAL MODEL*****
+## Use top 20 factors
+training3 <- training2[,c(vndata,49)]
+testing3 <- testing2[,c(vndata,49)]
+inTrain2 <- createDataPartition(y=training3$classe,p=0.6,times=1,list=FALSE)
+train21 <- training3[inTrain2,]
+test21 <- training3[-inTrain2,]
+
+## Random Forest model
+if(file.exists("modelFitrfinal.RDS")==TRUE){
+  modelFitrfinal <- readRDS(".\\modelFitrfinal.RDS")
+}else{
+  modelFitrfinal <- train(as.factor(classe) ~.,data=train21,method="rf")
+  saveRDS(modelFitrfinal,paste("modelFitrfinal.RDS"))
+}
+
+finalpreds <- predict(modelFitrfinal,newdata=test21)
+finalresult <- confusionMatrix(finalpreds,test21$classe)
+finalresult.table <- as.table(finalresult)
+
+finalresult.table
+```
+The above table shows the confusion matrix for the final model
+
+```{r,echo=FALSE}
+results4 <- matrix(c(varimpresult$overall[1:2],finalresult$overall[1:2]),
+                   ncol=2,byrow=TRUE)
+colnames(results4) <- names(rfresult$overall[1:2])
+rownames(results4) <- c("2.5% random forest 20vars","60% random forest 20vars")
+results4.table <- as.table(results4)
+results4.table
+```
+This table compares the model trained on 2.5% of data with the final model trained on 60% of data. The final model has very high out of sample accuracy, and its predictions were all scored as correct through the on-line submission.
+
+```{r,echo=FALSE,eval=FALSE}
+##*****output predictions for assessment*****
+predictionsOut <- predict(modelFitrfinal,newdata=testing3[,-49])
+
+testset <- as.character(predictionsOut)
+answers <- as.vector(testset)
+x <- answers
+
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(answers)
+```
+###Further work
+The following items could be tackled, but time constraints mitigated against it.
+
+* Reduce the number of covariates
+* Build low sample models from K-fold data slicing
+* Show the decision tree system that makes up the model
