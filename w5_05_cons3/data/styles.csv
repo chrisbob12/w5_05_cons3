@@ -1,0 +1,5 @@
+style,freq,font,bg,panel
+1,10,black,white,no
+2,1,red,white,no
+3,6,white,black,yes
+4,3,white,red,yes
